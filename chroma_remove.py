@@ -82,6 +82,17 @@ def process_image(img, tolerance=40):
     # Set alpha to 0 for background pixels
     alpha[mask] = 0
 
+    # Auto-crop logic
+    # Find all non-zero alpha pixels
+    coords = cv2.findNonZero(alpha)
+    if coords is not None:
+        x, y, w, h = cv2.boundingRect(coords)
+        # Crop to bounding box
+        b = b[y:y+h, x:x+w]
+        g = g[y:y+h, x:x+w]
+        r = r[y:y+h, x:x+w]
+        alpha = alpha[y:y+h, x:x+w]
+
     return cv2.merge([b, g, r, alpha])
 
 def remove_chroma(input_path, output_path, tolerance=40):
