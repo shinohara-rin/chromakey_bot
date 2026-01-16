@@ -1,4 +1,5 @@
 import os
+import asyncio
 import logging
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
@@ -18,7 +19,8 @@ logging.basicConfig(
     level=logging.INFO
 )
 
-async def process_and_reply(update: Update, telegram_file):
+
+async def process_and_reply(update: Update, attachment):
     """
     Downloads file to memory, processes it, and sends the result back.
     Shared logic for both Photo and Document attributes.
@@ -27,52 +29,74 @@ async def process_and_reply(update: Update, telegram_file):
     status_msg = await update.message.reply_text("⏳ Processing...")
     
     try:
-        # 10MB limit check (file_size is in bytes)
-        # telegram_file object usually has file_size attribute, but for PhotoSize it definitely does.
-        # For a File object obtained via get_file(), file_size is also available.
-        if telegram_file.file_size and telegram_file.file_size > 10 * 1024 * 1024:
+        # 10MB limit check
+        if attachment.file_size and attachment.file_size > 10 * 1024 * 1024:
             await status_msg.edit_text("❌ File is too big. Please send an image smaller than 10MB.")
+            return
+
+        # Get the actual file object (this effectively 'prepares' the download link)
+        # We do this here so it doesn't block the main handler
+        try:
+            telegram_file = await attachment.get_file()
+        except Exception as e:
+            logging.error(f"Failed to get file info: {e}")
+            await status_msg.edit_text("❌ Could not retrieve file information from Telegram.")
             return
 
         # Download file to memory
         with io.BytesIO() as f_in:
             await telegram_file.download_to_memory(out=f_in)
             f_in.seek(0)
-            file_bytes = np.asarray(bytearray(f_in.read()), dtype=np.uint8)
-            
-            # Decode image - this acts as a robust prefix/magic byte check
-            img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-            if img is None:
-                 await status_msg.edit_text("❌ The file you sent doesn't look like a valid image.")
-                 return
+            file_bytes = f_in.read()
 
-            # Process image (in-memory)
-            try:
-                result_img = chroma_remove.process_image(img)
-            except ValueError as e:
-                await status_msg.edit_text(f"❌ Processing failed: {e}")
-                return
+        # Run CPU-bound processing in a separate thread
+        loop = asyncio.get_running_loop()
+        try:
+            encoded_img = await loop.run_in_executor(None, process_image_sync, file_bytes)
+        except ValueError as e:
+            await status_msg.edit_text(str(e))
+            return
 
-            # Encode result to PNG
-            success, encoded_img = cv2.imencode('.png', result_img)
-            if not success:
-                raise ValueError("Could not encode result image")
-            
-            # Delete status message before sending result
-            await status_msg.delete()
+        # Delete status message before sending result
+        await status_msg.delete()
 
-            # Send result back from memory
-            with io.BytesIO(encoded_img.tobytes()) as f_out:
-                f_out.name = "processed.png"
-                await update.message.reply_document(document=f_out, filename="processed.png")
+        # Send result back from memory
+        with io.BytesIO(encoded_img.tobytes()) as f_out:
+            f_out.name = "processed.png"
+            await update.message.reply_document(document=f_out, filename="processed.png")
         
     except Exception as e:
         logging.error(f"Error processing image: {e}")
         try:
             await status_msg.edit_text("❌ An internal error occurred while processing the image.")
         except Exception:
-            # If editing fails (e.g. message deleted), just log it
              logging.error("Could not edit status message to report error.")
+
+def process_image_sync(file_bytes):
+    """
+    Synchronous function to handle CPU-bound image processing.
+    Decodes, processes, and encodes the image.
+    """
+    # Convert bytes to numpy array
+    nparr = np.frombuffer(file_bytes, np.uint8)
+    
+    # Decode image
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if img is None:
+         raise ValueError("❌ The file you sent doesn't look like a valid image.")
+
+    # Process image
+    try:
+        result_img = chroma_remove.process_image(img)
+    except ValueError as e:
+        raise ValueError(f"❌ Processing failed: {e}")
+
+    # Encode result to PNG
+    success, encoded_img = cv2.imencode('.png', result_img)
+    if not success:
+        raise ValueError("Could not encode result image")
+        
+    return encoded_img
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.photo:
@@ -81,9 +105,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     logging.info(f"Received photo from {user.first_name} (id: {user.id})")
 
-    # Get the file ID of the largest photo
-    photo_file = await update.message.photo[-1].get_file()
-    await process_and_reply(update, photo_file)
+    # Get the largest photo.
+    # We pass the PhotoSize object itself to the background task.
+    # AND we use create_task to not block the receiver loop
+    photo_size = update.message.photo[-1]
+    asyncio.create_task(process_and_reply(update, photo_size))
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.document:
@@ -94,21 +120,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # MIME type check (basic filter)
     if not doc.mime_type or not doc.mime_type.startswith('image/'):
-        # Optionally silently ignore non-images or tell the user
-        # await update.message.reply_text("Please send an image file.")
         return
 
     logging.info(f"Received document from {user.first_name} (id: {user.id}), size: {doc.file_size}")
 
-    # For documents, we must get the file object to check size accurately via API if needed, 
-    # but the Document object itself usually has file_size.
-    if doc.file_size and doc.file_size > 10 * 1024 * 1024:
-         await update.message.reply_text("File is too big. Please send an image smaller than 10MB.")
-         return
-
-    # Get the actual file object for downloading
-    doc_file = await doc.get_file()
-    await process_and_reply(update, doc_file)
+    # Pass the Document object itself to the background task
+    asyncio.create_task(process_and_reply(update, doc))
 
 if __name__ == '__main__':
     TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -116,7 +133,15 @@ if __name__ == '__main__':
         print("Error: TELEGRAM_BOT_TOKEN not found in environment variables.")
         exit(1)
 
-    application = ApplicationBuilder().token(TOKEN).build()
+    # Increase connection pool timeouts to handle multiple concurrent uploads better
+    application = (
+        ApplicationBuilder()
+        .token(TOKEN)
+        .connect_timeout(30.0)
+        .read_timeout(30.0)
+        .write_timeout(30.0)
+        .build()
+    )
     
     photo_handler = MessageHandler(filters.PHOTO, handle_photo)
     document_handler = MessageHandler(filters.Document.ALL, handle_document)
