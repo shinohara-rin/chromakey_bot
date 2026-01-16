@@ -23,12 +23,15 @@ async def process_and_reply(update: Update, telegram_file):
     Downloads file to memory, processes it, and sends the result back.
     Shared logic for both Photo and Document attributes.
     """
+    # Send processing status
+    status_msg = await update.message.reply_text("⏳ Processing...")
+    
     try:
         # 10MB limit check (file_size is in bytes)
         # telegram_file object usually has file_size attribute, but for PhotoSize it definitely does.
         # For a File object obtained via get_file(), file_size is also available.
         if telegram_file.file_size and telegram_file.file_size > 10 * 1024 * 1024:
-            await update.message.reply_text("File is too big. Please send an image smaller than 10MB.")
+            await status_msg.edit_text("❌ File is too big. Please send an image smaller than 10MB.")
             return
 
         # Download file to memory
@@ -40,14 +43,14 @@ async def process_and_reply(update: Update, telegram_file):
             # Decode image - this acts as a robust prefix/magic byte check
             img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
             if img is None:
-                 await update.message.reply_text("The file you sent doesn't look like a valid image.")
+                 await status_msg.edit_text("❌ The file you sent doesn't look like a valid image.")
                  return
 
             # Process image (in-memory)
             try:
                 result_img = chroma_remove.process_image(img)
             except ValueError as e:
-                await update.message.reply_text(f"Processing failed: {e}")
+                await status_msg.edit_text(f"❌ Processing failed: {e}")
                 return
 
             # Encode result to PNG
@@ -55,6 +58,9 @@ async def process_and_reply(update: Update, telegram_file):
             if not success:
                 raise ValueError("Could not encode result image")
             
+            # Delete status message before sending result
+            await status_msg.delete()
+
             # Send result back from memory
             with io.BytesIO(encoded_img.tobytes()) as f_out:
                 f_out.name = "processed.png"
@@ -62,7 +68,11 @@ async def process_and_reply(update: Update, telegram_file):
         
     except Exception as e:
         logging.error(f"Error processing image: {e}")
-        await update.message.reply_text("An internal error occurred while processing the image.")
+        try:
+            await status_msg.edit_text("❌ An internal error occurred while processing the image.")
+        except Exception:
+            # If editing fails (e.g. message deleted), just log it
+             logging.error("Could not edit status message to report error.")
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.photo:
