@@ -33,6 +33,15 @@ def remove_chroma(input_path, output_path, tolerance=40):
     if img is None:
         raise ValueError(f"Could not read image {input_path}")
 
+def process_image(img, tolerance=40):
+    """
+    Process image to remove chromakey background.
+    Args:
+        img: numpy array (BGR)
+        tolerance: color tolerance
+    Returns:
+        numpy array (BGRA) with transparent background
+    """
     try:
         means = get_corner_samples(img)
     except Exception as e:
@@ -73,7 +82,14 @@ def remove_chroma(input_path, output_path, tolerance=40):
     # Set alpha to 0 for background pixels
     alpha[mask] = 0
 
-    result = cv2.merge([b, g, r, alpha])
+    return cv2.merge([b, g, r, alpha])
+
+def remove_chroma(input_path, output_path, tolerance=40):
+    img = cv2.imread(input_path)
+    if img is None:
+        raise ValueError(f"Could not read image {input_path}")
+
+    result = process_image(img, tolerance)
     cv2.imwrite(output_path, result)
     print(f"Success! Saved result to {output_path}")
 

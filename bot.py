@@ -5,6 +5,10 @@ from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filte
 from dotenv import load_dotenv
 import chroma_remove
 
+import cv2
+import numpy as np
+import io
+
 # Load environment variables
 load_dotenv()
 
@@ -24,30 +28,36 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Get the file ID of the largest photo
     photo_file = await update.message.photo[-1].get_file()
     
-    # Download file
-    input_filename = f"temp_{user.id}_in.jpg"
-    output_filename = f"temp_{user.id}_out.png"
-    
     try:
-        await photo_file.download_to_drive(input_filename)
-        
-        # Process image
-        chroma_remove.remove_chroma(input_filename, output_filename)
-        
-        # Send result back
-        await update.message.reply_document(document=open(output_filename, 'rb'), filename="processed.png")
+        # Download file to memory
+        with io.BytesIO() as f_in:
+            await photo_file.download_to_memory(out=f_in)
+            f_in.seek(0)
+            file_bytes = np.asarray(bytearray(f_in.read()), dtype=np.uint8)
+            
+            # Decode image
+            img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+            if img is None:
+                 raise ValueError("Could not decode image")
+
+            # Process image (in-memory)
+            result_img = chroma_remove.process_image(img)
+            
+            # Encode result to PNG
+            success, encoded_img = cv2.imencode('.png', result_img)
+            if not success:
+                raise ValueError("Could not encode result image")
+            
+            # Send result back from memory
+            with io.BytesIO(encoded_img.tobytes()) as f_out:
+                f_out.name = "processed.png"
+                await update.message.reply_document(document=f_out, filename="processed.png")
         
     except ValueError as val_err:
         await update.message.reply_text(f"Processing failed: {val_err}")
     except Exception as e:
         logging.error(f"Error processing image: {e}")
         await update.message.reply_text("An internal error occurred while processing the image.")
-    finally:
-        # Cleanup
-        if os.path.exists(input_filename):
-            os.remove(input_filename)
-        if os.path.exists(output_filename):
-            os.remove(output_filename)
 
 if __name__ == '__main__':
     TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
